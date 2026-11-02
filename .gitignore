@@ -1,0 +1,52 @@
+# Environment & Secrets
+.env
+.env.*
+*.env
+!.env.example
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Vector Stores & Local Databases (ChromaDB / SQLite)
+chroma_db/
+*.sqlite
+*.sqlite3
+*.db
+
+# Uploads & User Data
+uploads/*
+!uploads/.gitkeep
+
+# Logs & Runtime
+*.log
+logs/
+*.tmp
+*.temp
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Operating System Files
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,12 @@
+python-dotenv
+
+google-genai
+groq
+
+fastapi
+uvicorn
+
+pymupdf
+
+motor
+pymongo
