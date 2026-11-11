@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from google import genai
 from groq import AsyncGroq
+from app.ai.constants import GEMINI_CHAT_MODEL, GROQ_CHAT_MODEL, GROQ_TEMPERATURE
 from app.core.config import settings
 from app.ai.prompts.gemini_prompt import SYSTEM_PROMPT
 
@@ -16,7 +17,7 @@ class Models:
         self.gemini_client = genai.Client(api_key = settings.GEMINI_API_KEY)
         self.groq_client = AsyncGroq(api_key = settings.GROQ_API_KEY)
 
-    async def stream_gemini(self, prompt: str, model_name: str = "gemini-2.5-flash") -> AsyncIterator[str]:
+    async def stream_gemini(self, prompt: str, model_name: str = GEMINI_CHAT_MODEL) -> AsyncIterator[str]:
         """
         Streams Google Gemini's response, yielding text pieces as they arrive.
         Any API errors are raised so that retry and fallback logic can handle them.
@@ -31,7 +32,7 @@ class Models:
             if chunk.text:
                 yield chunk.text
 
-    async def stream_groq(self, prompt: str, model_name: str = "openai/gpt-oss-20b") -> AsyncIterator[str]:
+    async def stream_groq(self, prompt: str, model_name: str = GROQ_CHAT_MODEL) -> AsyncIterator[str]:
         """
         Streams Groq's response, yielding text pieces as they arrive.
         Any API errors are raised so that retry and fallback logic can handle them.
@@ -49,7 +50,7 @@ class Models:
                 },
             ],
             stream = True,
-            temperature = 1.0,
+            temperature = GROQ_TEMPERATURE,
         )
 
         async for chunk in chat_completion:
@@ -63,8 +64,8 @@ class Models:
         Format: [ (display_name, stream_function), ... ]
         """
         return [
-            ("Gemini (Google)", self.stream_gemini),
             ("Groq (OpenAI/OSS)", self.stream_groq),
+            ("Gemini (Google)", self.stream_gemini),
         ]
 
 

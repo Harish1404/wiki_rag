@@ -1,46 +1,21 @@
 import asyncio
 import logging
-import random
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 
-logger = logging.getLogger("uvicorn.error")
+from app.ai.constants import (
+    BATCH_BASE_RETRY_DELAY,
+    BATCH_MAX_RETRY_DELAY,
+    CHARS_PER_TOKEN,
+    RATE_LIMIT_WINDOW,
+)
+from app.utils.retry import retry_with_jitter
 
+logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────
-# Settings: pass one of these to BatchProcess, or your own values
-#
-#   batch_size          - items sent in one request
-#   max_concurrency     - batches allowed to run at the same time
-#   requests_per_minute - request limit (None = no limit)
-#   tokens_per_minute   - estimated token limit (None = no limit)
-#   max_retries         - total attempts per batch before giving up
-# ─────────────────────────────────────────────────────────
-
-# Local model: no API limits, and it's CPU-bound, so run one batch at a time
-LOCAL_EMBEDDING_SETTINGS = {
-    "batch_size": 32,
-    "max_concurrency": 1,
-    "requests_per_minute": None,
-    "tokens_per_minute": None,
-    "max_retries": 1,
-}
-
-# gemini-embedding-001: kept below the reported free tier limits of
-# 100 requests/min and 30k tokens/min. Check the real limits in AI Studio.
-GEMINI_FREE_TIER_SETTINGS = {
-    "batch_size": 20,
-    "max_concurrency": 2,
-    "requests_per_minute": 80,
-    "tokens_per_minute": 25_000,
-    "max_retries": 5,
-}
-
-BASE_RETRY_DELAY = 5.0    # seconds, first retry waits up to this long
-MAX_RETRY_DELAY = 60.0    # seconds, longest possible wait between retries
-RATE_LIMIT_WINDOW = 60.0  # seconds, the "per minute" window for the limits
-CHARS_PER_TOKEN = 4       # rough estimate: 1 token is about 4 characters
+# Settings presets (GEMINI_FREE_TIER_SETTINGS, LOCAL_EMBEDDING_SETTINGS)
+# live in app/ai/constants.py — pass one of them to BatchProcess(**settings).
 
 
 class BatchProcess:
@@ -149,35 +124,33 @@ class BatchProcess:
 
             tokens = self._estimate_tokens(batch)
 
-            for attempt in range(1, self.max_retries + 1):
-                # Inside the loop because retries use up quota too
+            async def attempt() -> list:
+                # Inside each attempt because retries use up quota too
                 await self._wait_for_rate_limit(tokens)
 
-                try:
-                    results = await func(batch)
+                results = await func(batch)
 
-                    # A short result would put the wrong embedding on the wrong chunk
-                    if len(results) != len(batch):
-                        raise ValueError(f"Expected {len(batch)} results, got {len(results)}")
+                # A short result would put the wrong embedding on the wrong chunk
+                if len(results) != len(batch):
+                    raise ValueError(f"Expected {len(batch)} results, got {len(results)}")
 
-                    logger.info(f"Batch {index}/{total} done ({len(batch)} items)")
-                    return results
+                return results
 
-                except Exception as error:
-                    if attempt >= self.max_retries:
-                        logger.error(f"Batch {index}/{total} failed after {attempt} attempts: {error}")
-                        stop.set()
-                        raise
+            try:
+                results = await retry_with_jitter(
+                    attempt,
+                    max_retries=self.max_retries,
+                    base_delay=BATCH_BASE_RETRY_DELAY,
+                    max_delay=BATCH_MAX_RETRY_DELAY,
+                    label=f"Batch {index}/{total}",
+                )
+            except Exception:
+                # Tell the batches still waiting not to spend quota
+                stop.set()
+                raise
 
-                    # Exponential backoff with full jitter
-                    backoff = min(MAX_RETRY_DELAY, BASE_RETRY_DELAY * (2 ** (attempt - 1)))
-                    sleep_time = random.uniform(0, backoff)
-
-                    logger.warning(
-                        f"Batch {index}/{total} attempt {attempt}/{self.max_retries} failed: {error}. "
-                        f"Retrying in {sleep_time:.1f}s"
-                    )
-                    await asyncio.sleep(sleep_time)
+            logger.info(f"Batch {index}/{total} done ({len(batch)} items)")
+            return results
 
     # ─────────────────────────────────────────────────────────
     # Step 4: Put it together — items -> results, in the same order
@@ -223,3 +196,4 @@ class BatchProcess:
 
         logger.info(f"Batch processing finished: {len(results)} items in {time.monotonic() - started_at:.1f}s")
         return results
+

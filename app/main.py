@@ -45,6 +45,6 @@ def landing_page():
 
 @app.get("/health")
 def health():
-    return {" status": "ok"}
+    return {"status": "ok"}
 
 app.include_router(chat.router)

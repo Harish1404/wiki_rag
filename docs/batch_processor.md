@@ -2,7 +2,8 @@
 
 This guide explains what the batch processor does, what each constant means, and how a run works from start to finish.
 
-**Code:** [`app/ai/batchs/batch_processing.py`](../app/ai/batchs/batch_processing.py)
+**Code:** [`app/ai/batchs/batch_processing.py`](../app/ai/batchs/batch_processing.py)  
+**Settings:** [`app/ai/constants.py`](../app/ai/constants.py) · **Retry helper:** [`app/utils/retry.py`](../app/utils/retry.py)  
 **Used by:** [`app/ai/rag/embed.py`](../app/ai/rag/embed.py)
 
 ---
@@ -38,8 +39,8 @@ Picture a company that has to deliver a warehouse full of parcels across a toll 
 | The minute the bridge staff count over | The rate limit window | `RATE_LIMIT_WINDOW` |
 | Guessing a parcel's weight from its size | Estimating tokens from characters | `CHARS_PER_TOKEN` |
 | Delivery attempts before giving up | Attempts per batch | `max_retries` |
-| Wait after the first failed delivery | First retry wait | `BASE_RETRY_DELAY` |
-| Longest wait between attempts | Retry wait cap | `MAX_RETRY_DELAY` |
+| Wait after the first failed delivery | First retry wait | `BATCH_BASE_RETRY_DELAY` |
+| Longest wait between attempts | Retry wait cap | `BATCH_MAX_RETRY_DELAY` |
 
 The sections below use this analogy for each constant.
 
@@ -47,7 +48,7 @@ The sections below use this analogy for each constant.
 
 ## The constants
 
-There are two groups of constants at the top of `batch_processing.py`.
+There are two groups of constants, both in `app/ai/constants.py`.
 
 ### Group 1: the settings presets
 
@@ -144,20 +145,21 @@ Every attempt counts, including retries, because a failed request still uses you
 These apply to every `BatchProcess`. They aren't in the presets, so you change them by editing the file.
 
 ```python
-BASE_RETRY_DELAY = 5.0
-MAX_RETRY_DELAY = 60.0
+BATCH_BASE_RETRY_DELAY = 5.0
+BATCH_MAX_RETRY_DELAY = 60.0
 RATE_LIMIT_WINDOW = 60.0
 CHARS_PER_TOKEN = 4
 ```
 
-#### `BASE_RETRY_DELAY` and `MAX_RETRY_DELAY`: how long to wait before retrying
+#### `BATCH_BASE_RETRY_DELAY` and `BATCH_MAX_RETRY_DELAY`: how long to wait before retrying
 
 **Analogy:** if nobody answers the door, the driver waits a little before trying again, then longer each time. Drivers also pick a random wait, so they don't all come back at the same moment.
 
 The longest possible wait doubles after each failure and stops at the cap. The actual wait is a random time between 0 and that value. This is called **exponential backoff with full jitter**.
 
 ```python
-backoff = min(MAX_RETRY_DELAY, BASE_RETRY_DELAY * (2 ** (attempt - 1)))
+# app/utils/retry.py — jitter_delay(attempt, BATCH_BASE_RETRY_DELAY, BATCH_MAX_RETRY_DELAY)
+backoff = min(BATCH_MAX_RETRY_DELAY, BATCH_BASE_RETRY_DELAY * (2 ** (attempt - 1)))
 sleep_time = random.uniform(0, backoff)
 ```
 
@@ -376,7 +378,8 @@ These figures assume full-size chunks of 450 tokens at `tokens_per_minute = 25,0
 ### With a preset
 
 ```python
-from app.ai.batchs.batch_processing import BatchProcess, GEMINI_FREE_TIER_SETTINGS
+from app.ai.batchs.batch_processing import BatchProcess
+from app.ai.constants import GEMINI_FREE_TIER_SETTINGS
 
 processor = BatchProcess(**GEMINI_FREE_TIER_SETTINGS)
 ```
@@ -436,9 +439,9 @@ results = await processor.run(["a", "b", "c"], shout_batch)
 | `requests_per_minute` | Preset | None / 80 | Requests that can start per window |
 | `tokens_per_minute` | Preset | None / 25,000 | Estimated tokens per window |
 | `max_retries` | Preset | 1 / 5 | Total attempts per batch |
-| `BASE_RETRY_DELAY` | File constant | 5.0s | Longest wait after the first failure |
-| `MAX_RETRY_DELAY` | File constant | 60.0s | Cap on the retry wait |
-| `RATE_LIMIT_WINDOW` | File constant | 60.0s | Length of the sliding window |
-| `CHARS_PER_TOKEN` | File constant | 4 | Characters per estimated token |
+| `BATCH_BASE_RETRY_DELAY` | `constants.py` | 5.0s | Longest wait after the first failure |
+| `BATCH_MAX_RETRY_DELAY` | `constants.py` | 60.0s | Cap on the retry wait |
+| `RATE_LIMIT_WINDOW` | `constants.py` | 60.0s | Length of the sliding window |
+| `CHARS_PER_TOKEN` | `constants.py` | 4 | Characters per estimated token |
 
 Preset values are shown as local / Gemini.

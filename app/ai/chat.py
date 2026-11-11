@@ -1,133 +1,229 @@
-import asyncio
 import json
-import random
-from collections.abc import AsyncIterator
+import logging
+
+from collections.abc import AsyncIterator, Callable
+
+from app.ai.constants import (
+    CHAT_BASE_RETRY_DELAY,
+    CHAT_MAX_RETRIES,
+    CHAT_MAX_RETRY_DELAY,
+    NO_CONTEXT_MESSAGE,
+)
 from app.ai.rag.pipeline import rag_pipeline
 from app.ai.models import models
 from app.ai.prompts.gemini_prompt import RAG_PROMPT_TEMPLATE
+from app.utils.retry import retry_with_jitter
 
 
-NO_CONTEXT_MESSAGE = "I couldn't find anything about that in the Virat Kohli document."
+logger = logging.getLogger(__name__)
 
 
 class ChatService:
 
-    @staticmethod
-    async def retry_with_jitter(func, *args, max_retries: int = 3, base_delay: float = 1.0, max_delay: float = 8.0, **kwargs):
-        """
-        Executes an async callable with Exponential Backoff and Full Jitter.
+    def __init__(
+        self,
+        rag_pipeline,
+        model_registry,
+        prompt_template: str
+    ):
 
-        Why Jitter?
-        When an API experiences rate limits or network issues, retrying immediately
-        or at identical intervals can overwhelm the server. Adding randomness ('jitter')
-        spreads out retry requests smoothly.
+        self.rag_pipeline = rag_pipeline
+        self.model_registry = model_registry
+        self.prompt_template = prompt_template
 
-        Formula:
-            backoff = min(max_delay, base_delay * (2 ** attempt))
-            sleep_time = random.uniform(0, backoff)
-        """
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                # Attempt to execute the function and return its result
-                return await func(*args, **kwargs)
-
-            except Exception as error:
-                # If all retries are exhausted, raise the error so fallback can take over
-                if attempt >= max_retries:
-                    print(f"  [x] Attempt {attempt}/{max_retries} failed: {error}")
-                    raise error
-
-                # Calculate backoff with full jitter
-                backoff = min(max_delay, base_delay * (2 ** (attempt - 1)))
-                sleep_time = random.uniform(0, backoff)
-
-                print(f"  [!] Attempt {attempt}/{max_retries} failed: {error}")
-                print(f"      Waiting {sleep_time:.2f}s (exponential backoff + jitter) before next retry...")
-                await asyncio.sleep(sleep_time)
+    # ----------------------------------
+    # Retry Mechanism
+    # ----------------------------------
 
     @staticmethod
-    async def _open_stream(model_func, prompt: str) -> tuple[str, AsyncIterator[str]]:
-        """
-        Starts a model stream and waits for its first token, so connection/auth
-        errors surface here (where they can be retried) instead of mid-answer.
-        """
+    async def _retry(label: str, func, *args):
+        """Retries `func(*args)` using the shared jitter helper and chat retry settings."""
+
+        return await retry_with_jitter(
+            func,
+            *args,
+            max_retries=CHAT_MAX_RETRIES,
+            base_delay=CHAT_BASE_RETRY_DELAY,
+            max_delay=CHAT_MAX_RETRY_DELAY,
+            label=label
+        )
+
+    # ----------------------------------
+    # Open LLM Stream
+    # ----------------------------------
+
+    async def _open_stream(
+        self,
+        model_func: Callable[[str], AsyncIterator[str]],
+        prompt: str
+    ) -> tuple[str, AsyncIterator[str]]:
+
         stream = model_func(prompt)
-        first_token = await anext(stream)
+
+        try:
+            first_token = await anext(stream)
+        except StopAsyncIteration:
+            raise RuntimeError("Model returned an empty response stream.")
+
         return first_token, stream
+
+    # ----------------------------------
+    # SSE Formatting
+    # ----------------------------------
 
     @staticmethod
     def _sse(event: dict) -> str:
-        return f"data: {json.dumps(event)}\n\n"
 
-    @staticmethod
-    async def chat(user_prompt: str) -> AsyncIterator[str]:
-        """
-        Retrieves relevant chunks for the question, then streams the answer as SSE events
-        from the first model in the fallback chain that responds.
+        return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-        Events: model -> token... -> sources -> done   (or error)
-        """
+    # ----------------------------------
+    # Main Chat Workflow
+    # ----------------------------------
 
-        # 1. Retrieve relevant chunks from the vector store
+    async def chat(
+        self,
+        user_prompt: str
+    ) -> AsyncIterator[str]:
+
+        # 1. Retrieve relevant document chunks
+
         try:
-            retrieval = await ChatService.retry_with_jitter(rag_pipeline.retrieve, user_prompt)
-        except Exception as error:
-            print(f"[Error] Retrieval failed: {error}")
-            yield ChatService._sse({"type": "error", "message": f"Could not search the document: {error}"})
+            retrieval = await self._retry(
+                "Document retrieval",
+                self.rag_pipeline.retrieve,
+                user_prompt
+            )
+
+        except Exception:
+            logger.exception("Document retrieval failed.")
+
+            yield self._sse({
+                "type": "error",
+                "message": "Could not search the documents."
+            })
             return
 
         if not retrieval["results"]:
-            yield ChatService._sse({"type": "token", "content": NO_CONTEXT_MESSAGE})
-            yield ChatService._sse({"type": "done"})
+
+            yield self._sse({
+                "type": "token",
+                "content": NO_CONTEXT_MESSAGE
+            })
+
+            yield self._sse({"type": "done"})
             return
 
-        # 2. Build the RAG prompt from the retrieved context
-        context, sources = rag_pipeline.build_context(retrieval["results"])
-        prompt = RAG_PROMPT_TEMPLATE.format(context = context, question = user_prompt)
+        # 2. Build context and construct prompt
 
-        print("\n" + "=" * 50)
-        print("Starting LLM Request with Fallback & Retry")
-        print("=" * 50)
+        context, sources = self.rag_pipeline.build_context(
+            retrieval["results"]
+        )
 
-        fallback_chain = models.get_fallback_chain()
+        prompt = self.prompt_template.format(
+            context=context,
+            question=user_prompt
+        )
 
-        # For loop to traverse each model candidate in order of priority
+        # 3. Get model fallback chain
+
+        fallback_chain = self.model_registry.get_fallback_chain()
+
+        # 4. Try each model until one successfully starts
+
         for model_name, model_func in fallback_chain:
-            print(f"\n[Provider] Trying: {model_name}...")
+
+            logger.info("Trying LLM provider: %s", model_name)
 
             try:
-                # Open the stream with our retry + jitter function (retries until the first token)
-                first_token, stream = await ChatService.retry_with_jitter(
-                    ChatService._open_stream, model_func, prompt
+                first_token, stream = await self._retry(
+                    f"Open {model_name} stream",
+                    self._open_stream,
+                    model_func,
+                    prompt
                 )
-            except Exception as error:
-                print(f"[Fallback Triggered] {model_name} failed all retries: {error}")
-                print(f"                      Switching to the next backup model in chain...")
+
+            except Exception:
+
+                logger.exception(
+                    "Provider %s failed. Trying next provider.",
+                    model_name
+                )
+
                 continue
 
-            yield ChatService._sse({"type": "model", "model": model_name})
-            yield ChatService._sse({"type": "token", "content": first_token})
+            # 5. Notify frontend about selected model
+
+            yield self._sse({
+                "type": "model",
+                "model": model_name
+            })
+
+            # 6. Send first token
+
+            yield self._sse({
+                "type": "token",
+                "content": first_token
+            })
+
+            # 7. Stream remaining tokens
 
             try:
+
                 async for token in stream:
-                    yield ChatService._sse({"type": "token", "content": token})
-            except Exception as error:
-                # Can't switch models mid-answer, so report the error and stop
-                print(f"[Error] {model_name} failed mid-stream: {error}")
-                yield ChatService._sse({"type": "error", "message": f"{model_name} failed mid-stream: {error}"})
+
+                    yield self._sse({
+                        "type": "token",
+                        "content": token
+                    })
+
+            except Exception:
+
+                logger.exception(
+                    "Provider %s failed during streaming.",
+                    model_name
+                )
+
+                yield self._sse({
+                    "type": "error",
+                    "message": f"{model_name} failed during streaming."
+                })
+
                 return
 
-            print(f"[Status] Successfully answered by {model_name}!")
-            yield ChatService._sse({"type": "sources", "sources": sources})
-            yield ChatService._sse({"type": "done"})
+            # 8. Send sources and completion event
+
+            yield self._sse({
+                "type": "sources",
+                "sources": sources
+            })
+
+            yield self._sse({"type": "done"})
+
+            logger.info(
+                "Successfully generated response using %s.",
+                model_name
+            )
+
             return
 
-        # If all models in the fallback chain fail, report it in the stream (status 200 is already sent)
-        yield ChatService._sse({
+        # 9. All providers failed
+
+        yield self._sse({
             "type": "error",
-            "message": "All LLM models in the fallback pipeline failed. Please check credentials or network."
+            "message": (
+                "All LLM providers failed. "
+                "Please check credentials or network."
+            )
         })
 
 
-chat_service = ChatService()
+# ----------------------------------
+# Application-level instance
+# ----------------------------------
+
+chat_service = ChatService(
+    rag_pipeline=rag_pipeline,
+    model_registry=models,
+    prompt_template=RAG_PROMPT_TEMPLATE
+)
+
