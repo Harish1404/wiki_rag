@@ -1,7 +1,10 @@
 python-dotenv
 
-google-genai
-groq
+langchain
+langchain-core
+langchain-google-genai
+langchain-groq
+langchain-mistralai
 
 fastapi
 uvicorn
@@ -10,3 +13,5 @@ pymupdf
 
 motor
 pymongo
+
+

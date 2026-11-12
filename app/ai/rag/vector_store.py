@@ -134,6 +134,7 @@ class VectorStore:
 
         return str(result.inserted_id)
 
+
     async def insert_chunks(
         self,
         source_id: str,
@@ -184,6 +185,7 @@ class VectorStore:
 
         return len(chunk_docs)
 
+
     async def mark_completed(self, source_id: str) -> str:
         """Flags a source as fully ingested. Returns the completion timestamp."""
 
@@ -198,6 +200,7 @@ class VectorStore:
         )
 
         return ingested_at
+
 
     async def delete_document(self, source_id: str) -> None:
         """Removes a source and all of its chunks (used to clean up partial ingestions)."""

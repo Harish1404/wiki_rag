@@ -31,9 +31,13 @@ EMBEDDING_DIMENSIONS = 3072                 # owned by the embedder; injected in
 # Chat LLMs
 # ─────────────────────────────────────────────────────────
 
-GEMINI_CHAT_MODEL = "gemini-3.5-flash-lite"
+# Fallback order: primary_llm (Groq) -> llm2 (Gemini) -> llm3 (Mistral)
 GROQ_CHAT_MODEL = "openai/gpt-oss-20b"
-GROQ_TEMPERATURE = 1.0
+GEMINI_CHAT_MODEL = "gemini-3.5-flash-lite"
+MISTRAL_CHAT_MODEL = "mistral-small-latest"
+
+LLM_TEMPERATURE = 1.0
+LLM_TIMEOUT = 60                            # seconds per model request
 
 
 # ─────────────────────────────────────────────────────────
@@ -63,9 +67,14 @@ class IngestionStatus(StrEnum):
 
 NO_CONTEXT_MESSAGE = "I couldn't find relevant information in the uploaded documents."
 
-CHAT_MAX_RETRIES = 3
+# ModelRetryMiddleware: retries per model before falling back to the next one
+CHAT_MAX_RETRIES = 3                        # retries after the first attempt
 CHAT_BASE_RETRY_DELAY = 1.0                 # seconds
 CHAT_MAX_RETRY_DELAY = 8.0                  # seconds
+CHAT_BACKOFF_FACTOR = 2.0
+
+# Runnable.with_retry on document retrieval (total attempts)
+RETRIEVAL_MAX_ATTEMPTS = 3
 
 
 # ─────────────────────────────────────────────────────────
@@ -101,3 +110,33 @@ BATCH_BASE_RETRY_DELAY = 5.0                # seconds, first retry waits up to t
 BATCH_MAX_RETRY_DELAY = 60.0                # seconds, longest possible wait between retries
 RATE_LIMIT_WINDOW = 60.0                    # seconds, the "per minute" window for the limits
 CHARS_PER_TOKEN = 4                         # rough estimate: 1 token is about 4 characters
+
+
+# ─────────────────────────────────────────────────────────
+# Query router
+# ─────────────────────────────────────────────────────────
+
+class Route(StrEnum):
+    RAG = "RAG"            # questions about Virat Kohli -> document search
+    TOOL = "TOOL"          # weather / INR->USD -> tool agent
+    DIRECT = "DIRECT"      # general questions -> model's own knowledge
+
+
+DEFAULT_ROUTE = Route.RAG                   # used when every router model fails
+ROUTER_TEMPERATURE = 0.0                    # routing must be deterministic
+ROUTER_MAX_ATTEMPTS = 2                     # attempts per router model before falling back
+
+
+# ─────────────────────────────────────────────────────────
+# Tools
+# ─────────────────────────────────────────────────────────
+
+INR_PER_USD = 93.75                         # rate used by inr_to_usd; update as needed
+TOOL_MAX_RETRIES = 2                        # ToolRetryMiddleware on the tool agent
+
+OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+HTTP_TIMEOUT = 10                           # seconds for tool HTTP calls
+
+SSE_TOOL_OUTPUT_LIMIT = 500                 # max chars of tool output sent to the frontend
+

@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 
 from app.ai.constants import CHUNKING_VERSION, DEFAULT_N_RESULTS, IngestionStatus
+from app.ai.prompts.gemini_prompt import CONTEXT_BLOCK_PROMPT
 from app.ai.rag.document_processing.processor import data_processor
 from app.ai.rag.embed import embedding
 from app.ai.rag.vector_store import vector_store
@@ -248,8 +249,11 @@ class RagPipeline:
             page_number = meta.get("page_number")
 
             context_blocks.append(
-                f"[Source: {filename}, page {page_number}]\n"
-                f"{result['document']}"
+                CONTEXT_BLOCK_PROMPT.format(
+                    filename=filename,
+                    page_number=page_number,
+                    text=result["document"]
+                )
             )
 
             source_key = (filename, page_number)
