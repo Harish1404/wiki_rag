@@ -2,7 +2,12 @@ import logging
 
 from pathlib import Path
 
-from app.ai.constants import CHUNKING_VERSION, DEFAULT_N_RESULTS, IngestionStatus
+from app.ai.constants import (
+    CHUNKING_VERSION,
+    DEFAULT_N_RESULTS,
+    ChunkType,
+    IngestionStatus,
+)
 from app.ai.prompts.gemini_prompt import CONTEXT_BLOCK_PROMPT
 from app.ai.rag.document_processing.processor import data_processor
 from app.ai.rag.embed import embedding
@@ -68,6 +73,7 @@ class RagPipeline:
         content = await self.data_processor.process_file(path)
 
         chunks = content["chunks"]
+        tables = content.get("tables", [])
 
         if not chunks:
             return {
@@ -92,7 +98,8 @@ class RagPipeline:
             "file_hash": file_hash,
             "file_size_bytes": content["file_size_bytes"],
             "ingestion_status": IngestionStatus.PENDING.value,
-            "chunk_count": len(chunks),
+            "chunk_count": len(chunks),          # searchable chunks (text + table parts)
+            "table_count": len(tables),          # physical tables found in the file
             "chunking_version": CHUNKING_VERSION,
             "embedding": {
                 "model_name": self.embedding.model_name,
@@ -102,9 +109,10 @@ class RagPipeline:
 
         source_id = await self.vector_store.insert_source(document_record)
 
-        # 6. Save chunks, then mark the source COMPLETED.
+        # 6. Save chunks, then the structured tables, then mark the source COMPLETED.
         #    If anything fails in between, the source stays PENDING and the
-        #    next run cleans it up (step 2) instead of skipping it forever.
+        #    next run cleans it up (step 2: source + chunks + tables) instead
+        #    of skipping it forever.
         await self.vector_store.insert_chunks(
             source_id=source_id,
             filename=content["filename"],
@@ -112,19 +120,27 @@ class RagPipeline:
             embeddings=embeddings
         )
 
+        if tables:
+            await self.vector_store.insert_tables(
+                source_id=source_id,
+                filename=content["filename"],
+                tables=tables
+            )
+
         ingested_at = await self.vector_store.mark_completed(source_id)
 
         logger.info(
-            "Successfully ingested '%s' with %d chunks.",
+            "Successfully ingested '%s' with %d chunks (%d tables).",
             path.name,
-            len(chunks)
+            len(chunks),
+            len(tables)
         )
 
         return {
             "status": IngestionStatus.COMPLETED,
             "message": (
                 f"File '{path.name}' ingested with "
-                f"{len(chunks)} chunks."
+                f"{len(chunks)} chunks ({len(tables)} tables)."
             ),
             "document": {
                 **document_record,
@@ -247,26 +263,44 @@ class RagPipeline:
 
             filename = meta.get("filename", "unknown")
             page_number = meta.get("page_number")
+            is_table = meta.get("chunk_type") == ChunkType.TABLE
+            table_id = meta.get("table_id") if is_table else None
+
+            label = ""
+
+            if is_table:
+                label = f", table {meta.get('table_index', 0) + 1}"
+
+                if meta.get("table_part", 1) > 1:
+                    label += f" (part {meta['table_part']})"
 
             context_blocks.append(
                 CONTEXT_BLOCK_PROMPT.format(
                     filename=filename,
                     page_number=page_number,
+                    label=label,
                     text=result["document"]
                 )
             )
 
-            source_key = (filename, page_number)
+            source_key = (filename, page_number, table_id)
 
             if source_key not in seen:
 
                 seen.add(source_key)
 
-                sources.append({
+                source = {
                     "filename": filename,
                     "page_number": page_number,
+                    "chunk_type": meta.get("chunk_type", ChunkType.TEXT.value),
                     "score": result.get("score")
-                })
+                }
+
+                if is_table:
+                    source["table_id"] = table_id
+                    source["table_index"] = meta.get("table_index")
+
+                sources.append(source)
 
         return "\n\n".join(context_blocks), sources
 

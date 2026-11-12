@@ -27,6 +27,11 @@ def get_sources_collection():
     return get_database()["sources"]
 
 
+def get_tables_collection():
+    """Returns the 'tables' collection (structured tables extracted from PDFs)."""
+    return get_database()["tables"]
+
+
 async def connect_to_mongo():
     try:
         logger.info("⏳ Connecting to MongoDB...")

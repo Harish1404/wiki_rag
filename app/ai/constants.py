@@ -46,7 +46,20 @@ LLM_TIMEOUT = 60                            # seconds per model request
 
 CHUNK_SIZE = 300                            # words per chunk
 CHUNK_OVERLAP = 50                          # words repeated between chunks
-CHUNKING_VERSION = "v1"                     # bump when chunking logic changes
+CHUNKING_VERSION = "v2"                     # bump when chunking logic changes (v2: PDF tables)
+
+
+class ChunkType(StrEnum):
+    TEXT = "text"              # regular page text
+    TABLE = "table"            # markdown rendering of (part of) a PDF table
+
+
+# ─────────────────────────────────────────────────────────
+# Table extraction (PDF)
+# ─────────────────────────────────────────────────────────
+
+TABLE_MIN_ROWS = 1                          # data rows needed to keep a detected table
+TABLE_ROWS_PER_CHUNK = 20                   # rows per table chunk; header repeated in every part
 
 
 # ─────────────────────────────────────────────────────────

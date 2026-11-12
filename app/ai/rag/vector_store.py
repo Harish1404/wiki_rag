@@ -12,16 +12,27 @@ from app.ai.constants import (
     VECTOR_FILTER_FIELD,
     VECTOR_INDEX_NAME,
     VECTOR_SIMILARITY,
+    ChunkType,
     IngestionStatus,
 )
 from app.ai.rag.embed import embedding
 from app.db.mongo import (
     get_chunks_collection,
-    get_sources_collection
+    get_sources_collection,
+    get_tables_collection
 )
 
 
 logger = logging.getLogger(__name__)
+
+# Table reference fields copied onto table chunks (the full rows live in `tables`)
+TABLE_CHUNK_FIELDS = ("table_id", "table_index", "table_part", "row_start", "row_end")
+
+# Fields of a structured table stored in the `tables` collection
+TABLE_FIELDS = (
+    "table_id", "page_number", "table_index", "header", "rows",
+    "row_count", "col_count", "bbox", "markdown",
+)
 
 
 class VectorStore:
@@ -158,21 +169,26 @@ class VectorStore:
 
         source_oid = ObjectId(source_id)
 
-        chunk_docs = [
-            {
+        chunk_docs = []
+
+        for chunk, emb in zip(chunks, embeddings, strict=True):
+
+            chunk_type = chunk.get("chunk_type", ChunkType.TEXT.value)
+
+            doc = {
                 "source_id": source_oid,
                 "filename": filename,
                 "chunk_index": chunk["chunk_index"],
+                "chunk_type": chunk_type,
                 "page_number": chunk["page_number"],
                 "text": chunk["text"],
                 "embedding": emb
             }
-            for chunk, emb in zip(
-                chunks,
-                embeddings,
-                strict=True
-            )
-        ]
+
+            if chunk_type == ChunkType.TABLE:
+                doc.update({field: chunk[field] for field in TABLE_CHUNK_FIELDS})
+
+            chunk_docs.append(doc)
 
         if chunk_docs:
             await get_chunks_collection().insert_many(chunk_docs)
@@ -184,6 +200,49 @@ class VectorStore:
         )
 
         return len(chunk_docs)
+
+
+    async def insert_tables(
+        self,
+        source_id: str,
+        filename: str,
+        tables: list[dict]
+    ) -> int:
+        """Stores the structured tables of a source in `tables`. Returns the count."""
+
+        source_oid = ObjectId(source_id)
+
+        table_docs = [
+            {
+                "source_id": source_oid,
+                "filename": filename,
+                **{field: table[field] for field in TABLE_FIELDS}
+            }
+            for table in tables
+        ]
+
+        if table_docs:
+            await get_tables_collection().insert_many(table_docs)
+
+        logger.info("Inserted %d tables for '%s'.", len(table_docs), filename)
+
+        return len(table_docs)
+
+
+    async def get_tables(self, source_id: str) -> list[dict]:
+        """All structured tables of a source, in page / table order."""
+
+        cursor = get_tables_collection().find(
+            {"source_id": ObjectId(source_id)},
+            {"_id": 0}
+        ).sort([("page_number", 1), ("table_index", 1)])
+
+        tables = await cursor.to_list(length=None)
+
+        for table in tables:
+            table["source_id"] = str(table["source_id"])
+
+        return tables
 
 
     async def mark_completed(self, source_id: str) -> str:
@@ -203,17 +262,19 @@ class VectorStore:
 
 
     async def delete_document(self, source_id: str) -> None:
-        """Removes a source and all of its chunks (used to clean up partial ingestions)."""
+        """Removes a source and all of its chunks and tables (used to clean up partial ingestions)."""
 
         source_oid = ObjectId(source_id)
 
         chunks_result = await get_chunks_collection().delete_many({"source_id": source_oid})
+        tables_result = await get_tables_collection().delete_many({"source_id": source_oid})
         await get_sources_collection().delete_one({"_id": source_oid})
 
         logger.info(
-            "Deleted source %s and %d chunks.",
+            "Deleted source %s, %d chunks and %d tables.",
             source_id,
-            chunks_result.deleted_count
+            chunks_result.deleted_count,
+            tables_result.deleted_count
         )
 
     # -------------------------------
@@ -269,7 +330,9 @@ class VectorStore:
                     "source_id": 1,
                     "filename": 1,
                     "chunk_index": 1,
+                    "chunk_type": 1,
                     "page_number": 1,
+                    **{field: 1 for field in TABLE_CHUNK_FIELDS},
                     "score": {
                         "$meta": "vectorSearchScore"
                     }
@@ -281,15 +344,23 @@ class VectorStore:
 
         async for doc in collection.aggregate(pipeline):
 
+            metadata = {
+                "source_id": str(doc["source_id"]),
+                "filename": doc["filename"],
+                "chunk_index": doc["chunk_index"],
+                # Chunks stored before table support have no chunk_type
+                "chunk_type": doc.get("chunk_type", ChunkType.TEXT.value),
+                "page_number": doc["page_number"]
+            }
+
+            metadata.update({
+                field: doc[field] for field in TABLE_CHUNK_FIELDS if field in doc
+            })
+
             results.append({
                 "id": str(doc["_id"]),
                 "document": doc["text"],
-                "metadata": {
-                    "source_id": str(doc["source_id"]),
-                    "filename": doc["filename"],
-                    "chunk_index": doc["chunk_index"],
-                    "page_number": doc["page_number"]
-                },
+                "metadata": metadata,
                 "score": doc["score"]
             })
 

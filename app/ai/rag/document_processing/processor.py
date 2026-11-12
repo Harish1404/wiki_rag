@@ -44,12 +44,18 @@ class DocumentProcessor:
         if content is None:
             raise ValueError(f"Unsupported file type: {path}")
 
-        # Step 2: Generate chunks
-        chunks = self.chunker.chunk_pages(content["pages"])
+        pages = content["pages"]
 
-        # Step 3: Attach chunks to the document
+        # Step 2: Text chunks, then table chunks (indexes continue after the text)
+        text_chunks = self.chunker.chunk_pages(pages)
+        table_chunks = self.chunker.chunk_tables(pages, start_index=len(text_chunks))
+
+        chunks = text_chunks + table_chunks
+
+        # Step 3: Attach chunks and the structured tables to the document
         content["chunks"] = chunks
         content["total_chunks"] = len(chunks)
+        content["tables"] = [table for page in pages for table in page.get("tables", [])]
 
         return content
 

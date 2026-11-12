@@ -1,14 +1,48 @@
-from collections.abc import Callable
+import logging
+
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from uuid import uuid4
 
 import pymupdf
 
+from app.ai.constants import TABLE_MIN_ROWS
 from app.core.security import get_file_hash
+
+
+logger = logging.getLogger(__name__)
 
 
 # A loader takes a file path and returns the document dict built by
 # DocumentLoader._build_document_data (filename, hash, size, pages).
+# Every page is {"page_number", "text", "tables"}.
 Loader = Callable[[Path], dict]
+
+
+# ============================================================
+# TABLE HELPERS
+# ============================================================
+
+def _clean_cell(value) -> str:
+    """None -> "", and collapse newlines / repeated spaces inside a cell."""
+
+    return " ".join(str(value).split()) if value is not None else ""
+
+
+def rows_to_markdown(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    """Render a header + rows as a GitHub-style markdown table."""
+
+    width = len(header)
+
+    def line(cells: Sequence[str]) -> str:
+        cells = list(cells)[:width] + [""] * (width - len(cells))
+        return "| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |"
+
+    return "\n".join([
+        line(header),
+        "| " + " | ".join("---" for _ in range(width)) + " |",
+        *(line(row) for row in rows),
+    ])
 
 
 # ============================================================
@@ -84,7 +118,8 @@ class DocumentLoader:
         if text.strip():
             pages.append({
                 "page_number": 1,
-                "text": text
+                "text": text,
+                "tables": []
             })
 
         return self._build_document_data(
@@ -93,8 +128,89 @@ class DocumentLoader:
             pages=pages
         )
 
+    @staticmethod
+    def _extract_tables(page) -> list[dict]:
+        """
+        Detect tables on a PDF page with PyMuPDF's find_tables().
+        Never raises: if detection fails, the page is treated as having no tables
+        so normal text extraction still works.
+        """
+
+        page_number = page.number + 1
+
+        try:
+            found = page.find_tables().tables
+
+        except Exception as error:
+            logger.warning("Table detection failed on page %d: %s", page_number, error)
+            return []
+
+        tables = []
+
+        for table in found:
+
+            try:
+                cells = [[_clean_cell(c) for c in row] for row in table.extract()]
+                header = [_clean_cell(name) for name in table.header.names]
+
+                # Header taken from the first table row -> don't repeat it as data
+                if not table.header.external and cells:
+                    cells = cells[1:]
+
+                header = [name or f"Column {i + 1}" for i, name in enumerate(header)]
+                rows = [row for row in cells if any(row)]
+
+            except Exception as error:
+                logger.warning("Could not read a table on page %d: %s", page_number, error)
+                continue
+
+            if len(rows) < TABLE_MIN_ROWS:
+                continue
+
+            tables.append({
+                "table_id": str(uuid4()),
+                "table_index": len(tables),
+                "page_number": page_number,
+                "bbox": [float(x) for x in table.bbox],
+                "header": header,
+                "rows": rows,
+                "row_count": len(rows),
+                "col_count": len(header),
+                "markdown": rows_to_markdown(header, rows),
+            })
+
+        return tables
+
+    @staticmethod
+    def _text_outside(page, bboxes: list[list[float]]) -> str:
+        """
+        Page text without the words that belong to a table.
+
+        Works per word (not per block): a word is dropped only if its centre lies
+        inside a table area, so a paragraph that shares a block with table cells
+        is kept. Limitation: text printed INSIDE a table's box (e.g. a caption
+        drawn within the borders) is treated as table content.
+        """
+
+        if not bboxes:
+            return page.get_text()
+
+        rects = [pymupdf.Rect(b) for b in bboxes]
+        lines: dict[tuple[int, int], list[str]] = {}
+
+        for x0, y0, x1, y1, word, block_no, line_no, _ in page.get_text("words"):
+
+            centre = pymupdf.Point((x0 + x1) / 2, (y0 + y1) / 2)
+
+            if any(centre in rect for rect in rects):
+                continue
+
+            lines.setdefault((block_no, line_no), []).append(word)
+
+        return "\n".join(" ".join(words) for words in lines.values())
+
     def load_pdf(self, path: str | Path) -> dict:
-        """Extract text from each PDF page."""
+        """Extract text and tables from each PDF page."""
 
         path = Path(path)
         file_bytes = path.read_bytes()
@@ -105,12 +221,14 @@ class DocumentLoader:
 
             for page in pdf:
 
-                page_text = page.get_text()
+                tables = self._extract_tables(page)
+                page_text = self._text_outside(page, [t["bbox"] for t in tables])
 
-                if page_text and page_text.strip():
+                if (page_text and page_text.strip()) or tables:
                     pages.append({
                         "page_number": page.number + 1,
-                        "text": page_text
+                        "text": page_text,
+                        "tables": tables
                     })
 
         return self._build_document_data(
