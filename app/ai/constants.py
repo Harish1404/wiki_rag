@@ -5,7 +5,7 @@ Change a model, chunk size, limit or retry setting here — no other file
 should hard-code these values.
 """
 
-from enum import StrEnum
+from enum import Enum
 
 
 # ─────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ CHUNK_OVERLAP = 50                          # words repeated between chunks
 CHUNKING_VERSION = "v2"                     # bump when chunking logic changes (v2: PDF tables)
 
 
-class ChunkType(StrEnum):
+class ChunkType(str, Enum):
     TEXT = "text"              # regular page text
     TABLE = "table"            # markdown rendering of (part of) a PDF table
 
@@ -66,7 +66,7 @@ TABLE_ROWS_PER_CHUNK = 20                   # rows per table chunk; header repea
 # Ingestion
 # ─────────────────────────────────────────────────────────
 
-class IngestionStatus(StrEnum):
+class IngestionStatus(str, Enum):
     PENDING = "pending"        # source saved, chunks not confirmed yet
     COMPLETED = "completed"    # source + all chunks saved
     SKIPPED = "skipped"        # already ingested (same file hash)
@@ -129,7 +129,7 @@ CHARS_PER_TOKEN = 4                         # rough estimate: 1 token is about 4
 # Query router
 # ─────────────────────────────────────────────────────────
 
-class Route(StrEnum):
+class Route(str, Enum):
     RAG = "RAG"            # questions about Virat Kohli -> document search
     TOOL = "TOOL"          # weather / INR->USD -> tool agent
     DIRECT = "DIRECT"      # general questions -> model's own knowledge

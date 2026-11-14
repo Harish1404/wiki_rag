@@ -10,5 +10,7 @@ class Settings:
 
     MONGO_URL = os.getenv("MONGO_URL")
     DB_NAME = os.getenv("DB_NAME")
+
+    FRONTEND_URL = os.getenv("FRONTEND_URL")
     
 settings = Settings()
