@@ -1,21 +1,48 @@
+"""
+Chat service: route the question, then stream the matching handler's answer as SSE.
+
+    router.route(q) -> RAG | TOOL | DIRECT
+      RAG    : retrieve (with_retry) -> RAG_CHAT_PROMPT -> rag_agent      -> sources
+      TOOL   : tool_agent (weather_tool, inr_to_usd)                      -> tool events
+      DIRECT : direct_agent (general knowledge)
+
+Uses LangChain built-ins only:
+  - structured output + with_retry/with_fallbacks -> routing (app/ai/router.py)
+  - Runnable.with_retry        -> retrieval retry (exponential backoff + jitter)
+  - ChatPromptTemplate         -> question + context -> agent input messages
+  - create_agent + middleware  -> model fallback + retry, tool retry (app/ai/agent.py)
+  - astream_events(v2)         -> tokens, tool calls, and which model answered
+
+SSE events:
+  route -> [RAG: retrieval_start -> retrieval_end] -> [TOOL: tool_start -> tool_end]...
+        -> model -> token... -> [RAG: sources] -> done
+  (or error at any point)
+"""
+
 import json
 import logging
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda
+
+from app.ai.agent import agents_by_route
 from app.ai.constants import (
-    CHAT_BASE_RETRY_DELAY,
-    CHAT_MAX_RETRIES,
-    CHAT_MAX_RETRY_DELAY,
     NO_CONTEXT_MESSAGE,
+    RETRIEVAL_MAX_ATTEMPTS,
+    SSE_TOOL_OUTPUT_LIMIT,
+    Route,
 )
+from app.ai.prompts.gemini_prompt import RAG_CHAT_PROMPT
 from app.ai.rag.pipeline import rag_pipeline
-from app.ai.models import models
-from app.ai.prompts.gemini_prompt import RAG_PROMPT_TEMPLATE
-from app.utils.retry import retry_with_jitter
+from app.ai.router import QueryRouter, query_router
 
 
 logger = logging.getLogger(__name__)
+
+ALL_PROVIDERS_FAILED = "All LLM providers failed. Please check credentials or network."
 
 
 class ChatService:
@@ -23,61 +50,64 @@ class ChatService:
     def __init__(
         self,
         rag_pipeline,
-        model_registry,
-        prompt_template: str
+        router: QueryRouter,
+        agents: Mapping[Route, Runnable],
+        rag_prompt: ChatPromptTemplate
     ):
 
         self.rag_pipeline = rag_pipeline
-        self.model_registry = model_registry
-        self.prompt_template = prompt_template
+        self.router = router
+        self.agents = agents
+        self.rag_prompt = rag_prompt
 
-    # ----------------------------------
-    # Retry Mechanism
-    # ----------------------------------
-
-    @staticmethod
-    async def _retry(label: str, func, *args):
-        """Retries `func(*args)` using the shared jitter helper and chat retry settings."""
-
-        return await retry_with_jitter(
-            func,
-            *args,
-            max_retries=CHAT_MAX_RETRIES,
-            base_delay=CHAT_BASE_RETRY_DELAY,
-            max_delay=CHAT_MAX_RETRY_DELAY,
-            label=label
+        # LangChain's built-in retry around the document search
+        self.retriever: Runnable = RunnableLambda(
+            rag_pipeline.retrieve,
+            name="document_retrieval"
+        ).with_retry(
+            stop_after_attempt=RETRIEVAL_MAX_ATTEMPTS,
+            wait_exponential_jitter=True
         )
 
-    # ----------------------------------
-    # Open LLM Stream
-    # ----------------------------------
-
-    async def _open_stream(
-        self,
-        model_func: Callable[[str], AsyncIterator[str]],
-        prompt: str
-    ) -> tuple[str, AsyncIterator[str]]:
-
-        stream = model_func(prompt)
-
-        try:
-            first_token = await anext(stream)
-        except StopAsyncIteration:
-            raise RuntimeError("Model returned an empty response stream.")
-
-        return first_token, stream
+        # Route -> handler. A new route is a new entry here, not a new if/elif.
+        self._handlers: dict[Route, Callable[[str], AsyncIterator[str]]] = {
+            Route.RAG: self._handle_rag,
+            Route.TOOL: self._handle_tool,
+            Route.DIRECT: self._handle_direct,
+        }
 
     # ----------------------------------
-    # SSE Formatting
+    # SSE helpers
     # ----------------------------------
 
     @staticmethod
     def _sse(event: dict) -> str:
 
-        return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+
+    @staticmethod
+    def _model_label(metadata: dict) -> str:
+        """e.g. 'groq/openai/gpt-oss-20b', from LangChain's tracing metadata."""
+
+        provider = metadata.get("ls_provider") or "unknown"
+        model = metadata.get("ls_model_name") or "unknown"
+
+        return f"{provider}/{model}"
+
+    @staticmethod
+    def _tool_output_text(output) -> str:
+        """ToolMessage / str / other -> short text for the frontend."""
+
+        text = getattr(output, "content", output)
+        text = text if isinstance(text, str) else str(text)
+
+        if len(text) > SSE_TOOL_OUTPUT_LIMIT:
+            text = text[:SSE_TOOL_OUTPUT_LIMIT] + "…"
+
+        return text
 
     # ----------------------------------
-    # Main Chat Workflow
+    # Main entry point
     # ----------------------------------
 
     async def chat(
@@ -85,14 +115,29 @@ class ChatService:
         user_prompt: str
     ) -> AsyncIterator[str]:
 
+        decision = await self.router.route(user_prompt)
+
+        yield self._sse({
+            "type": "route",
+            "route": decision.route.value,
+            "reason": decision.reason
+        })
+
+        async for event in self._handlers[decision.route](user_prompt):
+            yield event
+
+    # ----------------------------------
+    # Route handlers
+    # ----------------------------------
+
+    async def _handle_rag(self, user_prompt: str) -> AsyncIterator[str]:
+
         # 1. Retrieve relevant document chunks
 
+        yield self._sse({"type": "retrieval_start", "query": user_prompt})
+
         try:
-            retrieval = await self._retry(
-                "Document retrieval",
-                self.rag_pipeline.retrieve,
-                user_prompt
-            )
+            retrieval = await self.retriever.ainvoke(user_prompt)
 
         except Exception:
             logger.exception("Document retrieval failed.")
@@ -103,118 +148,145 @@ class ChatService:
             })
             return
 
+        yield self._sse({
+            "type": "retrieval_end",
+            "results": retrieval["total_results"]
+        })
+
         if not retrieval["results"]:
 
-            yield self._sse({
-                "type": "token",
-                "content": NO_CONTEXT_MESSAGE
-            })
-
+            yield self._sse({"type": "token", "content": NO_CONTEXT_MESSAGE})
             yield self._sse({"type": "done"})
             return
 
-        # 2. Build context and construct prompt
+        # 2. Build context and the agent's input messages from the prompt template
 
-        context, sources = self.rag_pipeline.build_context(
-            retrieval["results"]
-        )
+        context, sources = self.rag_pipeline.build_context(retrieval["results"])
 
-        prompt = self.prompt_template.format(
-            context=context,
-            question=user_prompt
-        )
+        prompt_value = await self.rag_prompt.ainvoke({
+            "context": context,
+            "question": user_prompt
+        })
 
-        # 3. Get model fallback chain
+        # 3. Stream the answer, then sources
 
-        fallback_chain = self.model_registry.get_fallback_chain()
+        state = {}
 
-        # 4. Try each model until one successfully starts
+        async for event in self._stream_agent(
+            self.agents[Route.RAG],
+            prompt_value.to_messages(),
+            state
+        ):
+            yield event
 
-        for model_name, model_func in fallback_chain:
+        if state.get("ok"):
+            yield self._sse({"type": "sources", "sources": sources})
+            yield self._sse({"type": "done"})
 
-            logger.info("Trying LLM provider: %s", model_name)
+    async def _handle_tool(self, user_prompt: str) -> AsyncIterator[str]:
 
-            try:
-                first_token, stream = await self._retry(
-                    f"Open {model_name} stream",
-                    self._open_stream,
-                    model_func,
-                    prompt
-                )
+        async for event in self._answer(Route.TOOL, user_prompt):
+            yield event
 
-            except Exception:
+    async def _handle_direct(self, user_prompt: str) -> AsyncIterator[str]:
 
-                logger.exception(
-                    "Provider %s failed. Trying next provider.",
-                    model_name
-                )
+        async for event in self._answer(Route.DIRECT, user_prompt):
+            yield event
 
-                continue
+    async def _answer(self, route: Route, user_prompt: str) -> AsyncIterator[str]:
+        """Shared flow for routes whose input is just the question."""
 
-            # 5. Notify frontend about selected model
+        state = {}
 
-            yield self._sse({
-                "type": "model",
-                "model": model_name
-            })
+        async for event in self._stream_agent(
+            self.agents[route],
+            [HumanMessage(content=user_prompt)],
+            state
+        ):
+            yield event
 
-            # 6. Send first token
+        if state.get("ok"):
+            yield self._sse({"type": "done"})
 
-            yield self._sse({
-                "type": "token",
-                "content": first_token
-            })
+    # ----------------------------------
+    # Agent streaming (shared by all routes)
+    # ----------------------------------
 
-            # 7. Stream remaining tokens
+    async def _stream_agent(
+        self,
+        agent: Runnable,
+        messages: list[BaseMessage],
+        state: dict
+    ) -> AsyncIterator[str]:
+        """
+        Streams an agent run as SSE: model / token / tool_start / tool_end.
+        Sets state["ok"] = True when an answer was streamed; on failure it
+        yields an error event and leaves state["ok"] unset.
+        """
 
-            try:
+        answering_run = None
 
-                async for token in stream:
+        try:
+
+            async for event in agent.astream_events(
+                {"messages": messages},
+                version="v2"
+            ):
+
+                kind = event["event"]
+
+                if kind == "on_tool_start":
 
                     yield self._sse({
-                        "type": "token",
-                        "content": token
+                        "type": "tool_start",
+                        "tool": event["name"],
+                        "input": event["data"].get("input")
                     })
 
-            except Exception:
+                elif kind == "on_tool_end":
 
-                logger.exception(
-                    "Provider %s failed during streaming.",
-                    model_name
-                )
+                    yield self._sse({
+                        "type": "tool_end",
+                        "tool": event["name"],
+                        "output": self._tool_output_text(event["data"].get("output"))
+                    })
 
-                yield self._sse({
-                    "type": "error",
-                    "message": f"{model_name} failed during streaming."
-                })
+                elif kind == "on_chat_model_stream":
 
-                return
+                    text = event["data"]["chunk"].text
 
-            # 8. Send sources and completion event
+                    if not text:
+                        continue  # tool-call chunks, reasoning-only or empty chunks
 
-            yield self._sse({
-                "type": "sources",
-                "sources": sources
-            })
+                    # Announce the model on its first text token. A new run id means a
+                    # different call (fallback, or the answer after a tool call).
+                    if event["run_id"] != answering_run:
 
-            yield self._sse({"type": "done"})
+                        answering_run = event["run_id"]
+                        model = self._model_label(event.get("metadata", {}))
 
-            logger.info(
-                "Successfully generated response using %s.",
-                model_name
-            )
+                        logger.info("Answering with %s.", model)
 
+                        yield self._sse({"type": "model", "model": model})
+
+                    yield self._sse({"type": "token", "content": text})
+
+        except Exception:
+
+            logger.exception("All LLM providers failed.")
+
+            yield self._sse({"type": "error", "message": ALL_PROVIDERS_FAILED})
             return
 
-        # 9. All providers failed
+        if answering_run is None:
 
-        yield self._sse({
-            "type": "error",
-            "message": (
-                "All LLM providers failed. "
-                "Please check credentials or network."
-            )
-        })
+            yield self._sse({
+                "type": "error",
+                "message": "The model returned an empty answer."
+            })
+            return
+
+        state["ok"] = True
 
 
 # ----------------------------------
@@ -223,7 +295,7 @@ class ChatService:
 
 chat_service = ChatService(
     rag_pipeline=rag_pipeline,
-    model_registry=models,
-    prompt_template=RAG_PROMPT_TEMPLATE
+    router=query_router,
+    agents=agents_by_route,
+    rag_prompt=RAG_CHAT_PROMPT
 )
-
