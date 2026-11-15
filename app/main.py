@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes import chat
 from app.core.config import settings
-from app.db.mongo import connect_to_mongo, close_mongo
+from infra.db.mongo import connect_to_mongo, close_mongo
 from app.ai.rag.pipeline import rag_pipeline
 
 from contextlib import asynccontextmanager
