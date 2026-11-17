@@ -1,29 +1,7 @@
 from dotenv import load_dotenv
-import base64
-import binascii
 import os
 
 load_dotenv()
-
-
-def _issuer_from_publishable_key(publishable_key: str | None) -> str | None:
-    """
-    A Clerk publishable key looks like "pk_test_<base64 of 'xxx.clerk.accounts.dev$'>".
-    Decoding it gives the Frontend API host, which is the token issuer ("iss").
-    The publishable key is public, so this reveals nothing secret.
-    """
-    if not publishable_key or not publishable_key.startswith(("pk_test_", "pk_live_")):
-        return None
-
-    encoded = publishable_key.split("_", 2)[2]
-    try:
-        # Clerk strips base64 padding, so add it back before decoding.
-        decoded = base64.b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError):
-        return None
-
-    host = decoded.rstrip("$")
-    return f"https://{host}" if host else None
 
 
 def _split_csv(value: str | None) -> list[str]:
@@ -48,11 +26,11 @@ class Settings:
     CLERK_SECRET_KEY = os.getenv("CLERK_SECRET_KEY")
     # Optional PEM public key (Clerk Dashboard -> API Keys). Makes verification fully offline.
     CLERK_JWT_KEY = os.getenv("CLERK_JWT_KEY")
-    # Your Clerk Frontend API URL, e.g. https://xxx.clerk.accounts.dev — must match the token's "iss".
-    # If not set, it is worked out from CLERK_PUBLISHABLE_KEY.
-    CLERK_ISSUER = os.getenv("CLERK_ISSUER") or _issuer_from_publishable_key(
-        os.getenv("CLERK_PUBLISHABLE_KEY")
-    )
+    # Required. Your Clerk Frontend API URL, e.g. https://xxx.clerk.accounts.dev
+    # (Clerk Dashboard -> API Keys). Must match the token's "iss" claim exactly.
+    # Deliberately NOT guessed from other keys: a guessed value once pointed at the
+    # wrong Clerk app and rejected every token. The app refuses to start without it.
+    CLERK_ISSUER = os.getenv("CLERK_ISSUER")
     # Frontend origins allowed to use tokens (the token's "azp").
     # Defaults to FRONTEND_URL, then to the local dev server, so this check is never switched off.
     CLERK_AUTHORIZED_PARTIES = _split_csv(

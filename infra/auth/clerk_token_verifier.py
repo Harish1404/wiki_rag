@@ -96,7 +96,12 @@ class ClerkTokenVerifier:
 
         token_issuer = str(payload.get("iss", "")).rstrip("/")
         if token_issuer != self.issuer:
-            logger.warning("Rejected session token from an unexpected issuer.")
+            # Issuer URLs are public, so logging them is safe and makes mismatches obvious.
+            logger.warning(
+                "Rejected session token: issuer %s does not match CLERK_ISSUER %s",
+                token_issuer or "<missing>",
+                self.issuer,
+            )
             raise AuthenticationError("Invalid or expired session token.")
 
         clerk_user_id = payload.get("sub")
