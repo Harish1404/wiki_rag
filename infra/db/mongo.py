@@ -67,6 +67,11 @@ def get_tables_collection():
     return get_database()["tables"]
 
 
+def get_users_collection():
+    """Returns the 'users' collection (one application profile per Clerk user)."""
+    return get_database()["users"]
+
+
 # ──────────────────────────────────────────────────────────────
 # Lifecycle — called from app/main.py at startup and shutdown
 # ──────────────────────────────────────────────────────────────
