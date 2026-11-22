@@ -16,3 +16,12 @@ pymongo
 
 # Clerk authentication (session token verification + user profile lookup)
 clerk-backend-api
+
+# MCP connectors (LangChain's built-in MCP adapter, FastMCP underneath) + token encryption
+langchain[mcp]==1.5.0
+fastmcp==4.2.4
+cryptography
+
+# Tests: pip install pytest pytest-asyncio, then `python -m pytest`
+pytest
+pytest-asyncio

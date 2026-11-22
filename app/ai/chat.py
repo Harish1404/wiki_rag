@@ -5,6 +5,7 @@ Chat service: route the question, then stream the matching handler's answer as S
       RAG    : retrieve (with_retry) -> RAG_CHAT_PROMPT -> rag_agent      -> sources
       TOOL   : tool_agent (weather_tool, inr_to_usd)                      -> tool events
       DIRECT : direct_agent (general knowledge)
+      GITHUB : per-request agent with the user's own GitHub MCP tools      -> tool events
 
 Uses LangChain built-ins only:
   - structured output + with_retry/with_fallbacks -> routing (app/ai/router.py)
@@ -22,27 +23,37 @@ SSE events:
 import json
 import logging
 
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableLambda
 
-from app.ai.agent import agents_by_route
+from app.ai.agent import agents_by_route, build_agent
 from app.ai.constants import (
+    GITHUB_NOT_CONNECTED_MESSAGE,
+    GITHUB_UNAVAILABLE_MESSAGE,
     NO_CONTEXT_MESSAGE,
     RETRIEVAL_MAX_ATTEMPTS,
     SSE_TOOL_OUTPUT_LIMIT,
     Route,
 )
-from app.ai.prompts.gemini_prompt import RAG_CHAT_PROMPT
+from app.ai.prompts.gemini_prompt import GITHUB_ACCOUNT_PROMPT, GITHUB_SYSTEM_PROMPT, RAG_CHAT_PROMPT
 from app.ai.rag.pipeline import rag_pipeline
 from app.ai.router import QueryRouter, query_router
+from app.auth.models import User
+from app.connectors.errors import ConnectorError
+from app.connectors.service import ConnectorSession
+from app.core.container import connector_service
 
 
 logger = logging.getLogger(__name__)
 
 ALL_PROVIDERS_FAILED = "All LLM providers failed. Please check credentials or network."
+
+# (user, connector key) -> that user's tools + account name, or None when not connected.
+# Injected, so the chat service never touches the database, tokens or OAuth.
+ConnectorTools = Callable[[User, str], Awaitable[ConnectorSession | None]]
 
 
 class ChatService:
@@ -52,13 +63,15 @@ class ChatService:
         rag_pipeline,
         router: QueryRouter,
         agents: Mapping[Route, Runnable],
-        rag_prompt: ChatPromptTemplate
+        rag_prompt: ChatPromptTemplate,
+        connector_tools: ConnectorTools | None = None,
     ):
 
         self.rag_pipeline = rag_pipeline
         self.router = router
         self.agents = agents
         self.rag_prompt = rag_prompt
+        self.connector_tools = connector_tools
 
         # LangChain's built-in retry around the document search
         self.retriever: Runnable = RunnableLambda(
@@ -70,10 +83,11 @@ class ChatService:
         )
 
         # Route -> handler. A new route is a new entry here, not a new if/elif.
-        self._handlers: dict[Route, Callable[[str], AsyncIterator[str]]] = {
+        self._handlers: dict[Route, Callable[[str, User | None], AsyncIterator[str]]] = {
             Route.RAG: self._handle_rag,
             Route.TOOL: self._handle_tool,
             Route.DIRECT: self._handle_direct,
+            Route.GITHUB: self._handle_github,
         }
 
     # ----------------------------------
@@ -112,7 +126,8 @@ class ChatService:
 
     async def chat(
         self,
-        user_prompt: str
+        user_prompt: str,
+        user: User | None = None,
     ) -> AsyncIterator[str]:
 
         decision = await self.router.route(user_prompt)
@@ -123,14 +138,14 @@ class ChatService:
             "reason": decision.reason
         })
 
-        async for event in self._handlers[decision.route](user_prompt):
+        async for event in self._handlers[decision.route](user_prompt, user):
             yield event
 
     # ----------------------------------
     # Route handlers
     # ----------------------------------
 
-    async def _handle_rag(self, user_prompt: str) -> AsyncIterator[str]:
+    async def _handle_rag(self, user_prompt: str, user: User | None = None) -> AsyncIterator[str]:
 
         # 1. Retrieve relevant document chunks
 
@@ -183,15 +198,51 @@ class ChatService:
             yield self._sse({"type": "sources", "sources": sources})
             yield self._sse({"type": "done"})
 
-    async def _handle_tool(self, user_prompt: str) -> AsyncIterator[str]:
+    async def _handle_tool(self, user_prompt: str, user: User | None = None) -> AsyncIterator[str]:
 
         async for event in self._answer(Route.TOOL, user_prompt):
             yield event
 
-    async def _handle_direct(self, user_prompt: str) -> AsyncIterator[str]:
+    async def _handle_direct(self, user_prompt: str, user: User | None = None) -> AsyncIterator[str]:
 
         async for event in self._answer(Route.DIRECT, user_prompt):
             yield event
+
+    async def _handle_github(self, user_prompt: str, user: User | None = None) -> AsyncIterator[str]:
+        """Answers with the signed-in user's OWN GitHub tools; the agent is built per request."""
+
+        session = None
+        if user is not None and self.connector_tools is not None:
+            try:
+                session = await self.connector_tools(user, "github")
+            except Exception as error:
+                # ConnectorError carries a safe code; anything else, log only its class.
+                reason = error.code.value if isinstance(error, ConnectorError) else type(error).__name__
+                logger.warning("GitHub tools unavailable: %s", reason)
+                yield self._sse({"type": "token", "content": GITHUB_UNAVAILABLE_MESSAGE})
+                yield self._sse({"type": "done"})
+                return
+
+        if session is None or not session.tools:
+            yield self._sse({"type": "token", "content": GITHUB_NOT_CONNECTED_MESSAGE})
+            yield self._sse({"type": "done"})
+            return
+
+        # Tell the model whose account this is, so "my repos" needs no follow-up question.
+        # The login is public profile data, never a credential.
+        system_prompt = GITHUB_SYSTEM_PROMPT
+        if session.account_login:
+            system_prompt += GITHUB_ACCOUNT_PROMPT.format(login=session.account_login)
+
+        # A fresh agent per request: its tools carry only this user's token.
+        agent = build_agent("github_agent", system_prompt, tools=session.tools)
+
+        state = {}
+        async for event in self._stream_agent(agent, [HumanMessage(content=user_prompt)], state):
+            yield event
+
+        if state.get("ok"):
+            yield self._sse({"type": "done"})
 
     async def _answer(self, route: Route, user_prompt: str) -> AsyncIterator[str]:
         """Shared flow for routes whose input is just the question."""
@@ -297,5 +348,6 @@ chat_service = ChatService(
     rag_pipeline=rag_pipeline,
     router=query_router,
     agents=agents_by_route,
-    rag_prompt=RAG_CHAT_PROMPT
+    rag_prompt=RAG_CHAT_PROMPT,
+    connector_tools=connector_service.get_tools,
 )

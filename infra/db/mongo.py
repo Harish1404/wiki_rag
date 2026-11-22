@@ -72,6 +72,20 @@ def get_users_collection():
     return get_database()["users"]
 
 
+MCP_CONNECTIONS = "mcp_connections"
+OAUTH_TRANSACTIONS = "oauth_transactions"
+
+
+def get_mcp_connections_collection():
+    """Returns the 'mcp_connections' collection (one saved connector link per user + provider)."""
+    return get_database()[MCP_CONNECTIONS]
+
+
+def get_oauth_transactions_collection():
+    """Returns the 'oauth_transactions' collection (pending, single-use OAuth "Connect" clicks)."""
+    return get_database()[OAUTH_TRANSACTIONS]
+
+
 # ──────────────────────────────────────────────────────────────
 # Lifecycle — called from app/main.py at startup and shutdown
 # ──────────────────────────────────────────────────────────────

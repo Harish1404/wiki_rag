@@ -37,5 +37,27 @@ class Settings:
         os.getenv("CLERK_AUTHORIZED_PARTIES") or FRONTEND_URL or "http://localhost:3000"
     )
 
+    # ── MCP connectors ────────────────────────────────────────
+    # Fernet keys that encrypt users' connector tokens at rest. Comma-separated:
+    # the FIRST key encrypts new data, every key can decrypt (so keys can be rotated).
+    # Generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Without it, connectors are switched off (the rest of the app still runs).
+    CONNECTOR_ENCRYPTION_KEYS = _split_csv(os.getenv("CONNECTOR_ENCRYPTION_KEYS"))
+    # How long one MCP request (connect, list tools, call a tool) may take.
+    MCP_TIMEOUT_SECONDS = float(os.getenv("MCP_TIMEOUT_SECONDS") or 30)
+    # Browser origins the OAuth callback may send people back to. Same list as the
+    # origins allowed to use Clerk tokens, so the two can never disagree.
+    CONNECTOR_RETURN_ORIGINS = CLERK_AUTHORIZED_PARTIES
+
+    # GitHub (remote MCP server + the OAuth App registered on github.com)
+    GITHUB_REMOTE_SERVER = os.getenv("GITHUB_REMOTE_SERVER") or "https://api.githubcopilot.com/mcp"
+    GITHUB_CALLBACK_URL = os.getenv("GITHUB_CALLBACK_URL")
+    GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+    GITHUB_CLIENT_SECRET = os.getenv("GITHUB_SECRET_KEY")
+    # Which groups of GitHub tools the server exposes (see GitHub's MCP server docs).
+    # "context" holds get_me ("who am I"), which the assistant needs for "my repos".
+    GITHUB_MCP_TOOLSETS = os.getenv("GITHUB_MCP_TOOLSETS") or "context,repos,issues,pull_requests,users"
+
 
 settings = Settings()

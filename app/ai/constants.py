@@ -80,6 +80,13 @@ class IngestionStatus(str, Enum):
 
 NO_CONTEXT_MESSAGE = "I couldn't find relevant information in the uploaded documents."
 
+# GITHUB route, when the user hasn't connected GitHub (or must reconnect).
+GITHUB_NOT_CONNECTED_MESSAGE = (
+    "To answer questions about your GitHub repositories, connect your GitHub account first: "
+    "open **Connectors** in the sidebar and choose **Connect** on GitHub. Then ask me again."
+)
+GITHUB_UNAVAILABLE_MESSAGE = "I couldn't reach GitHub right now. Please try again in a moment."
+
 # ModelRetryMiddleware: retries per model before falling back to the next one
 CHAT_MAX_RETRIES = 3                        # retries after the first attempt
 CHAT_BASE_RETRY_DELAY = 1.0                 # seconds
@@ -133,6 +140,7 @@ class Route(str, Enum):
     RAG = "RAG"            # questions about Virat Kohli -> document search
     TOOL = "TOOL"          # weather / INR->USD -> tool agent
     DIRECT = "DIRECT"      # general questions -> model's own knowledge
+    GITHUB = "GITHUB"      # the user's own GitHub data -> GitHub MCP connector tools
 
 
 DEFAULT_ROUTE = Route.RAG                   # used when every router model fails

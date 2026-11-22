@@ -28,7 +28,10 @@ logger = logging.getLogger(__name__)
 class RouteDecision(BaseModel):
     """The route chosen for a user message."""
 
-    route: Route = Field(description="RAG for Virat Kohli questions, TOOL for weather or INR to USD, DIRECT for everything else.")
+    route: Route = Field(
+        description="RAG for Virat Kohli questions, TOOL for weather or INR to USD, "
+        "GITHUB for the user's own GitHub repos/issues/PRs, DIRECT for everything else."
+    )
     reason: str = Field(description="One short sentence explaining the choice.")
 
 

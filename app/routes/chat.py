@@ -40,7 +40,8 @@ async def chat(
     logger.info("Chat request from user id=%s", current_user.id)
 
     return StreamingResponse(
-        chat_service.chat(user_prompt.strip()),
+        # The user comes from the verified token, so the GitHub route uses only their own connection.
+        chat_service.chat(user_prompt.strip(), current_user),
         media_type="text/event-stream",
         status_code=200,
     )

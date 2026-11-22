@@ -12,6 +12,10 @@ captaincy, teams, awards, milestones, family. These are answered from a referenc
   - the **current weather** of a city (tool: weather_tool)
   - **converting Indian Rupees (INR) to US Dollars (USD)** (tool: inr_to_usd)
   Examples: "What's the weather in Chennai?", "Convert 5000 rupees to dollars", "Is it raining in Delhi?".
+- **GITHUB**: questions about the **user's own GitHub** — their repositories, issues, pull requests, \
+code, commits, branches, organisations or GitHub profile.
+  Examples: "List my GitHub repositories", "What are the open issues in my wiki_rag repo?", \
+"Show my latest pull requests", "What does the README of my project say?".
 - **DIRECT**: everything else that the assistant can answer from general knowledge — greetings, \
 small talk, explanations, coding, maths, general cricket rules or history not specific to Kohli.
   Examples: "Hi", "What is recursion?", "Explain the LBW rule", "Write a haiku about rain".
@@ -19,7 +23,9 @@ small talk, explanations, coding, maths, general cricket rules or history not sp
 ### Tie-break rules
 1. If the message is about Virat Kohli in any way, choose **RAG**.
 2. If it needs live weather or an INR->USD conversion (and is not about Kohli), choose **TOOL**.
-3. Otherwise choose **DIRECT**.
+3. If it asks about the user's own GitHub account or repositories, choose **GITHUB**. \
+General questions about Git or GitHub features (e.g. "what is a pull request?") are **DIRECT**.
+4. Otherwise choose **DIRECT**.
 
 Return the route and a one-sentence reason."""
 
